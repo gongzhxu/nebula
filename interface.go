@@ -35,6 +35,7 @@ type InterfaceConfig struct {
 	lightHouse              *LightHouse
 	checkInterval           int
 	pendingDeletionInterval int
+	promoteInterval         int
 	DropLocalBroadcast      bool
 	DropMulticast           bool
 	routines                int
@@ -172,7 +173,7 @@ func NewInterface(ctx context.Context, c *InterfaceConfig) (*Interface, error) {
 		l: c.l,
 	}
 
-	ifce.connectionManager = newConnectionManager(ctx, c.l, ifce, c.checkInterval, c.pendingDeletionInterval)
+	ifce.connectionManager = newConnectionManager(ctx, c.l, ifce, c.checkInterval, c.pendingDeletionInterval, c.promoteInterval)
 
 	return ifce, nil
 }

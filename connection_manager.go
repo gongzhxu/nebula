@@ -2,12 +2,14 @@ package nebula
 
 import (
 	"context"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/header"
 	"github.com/slackhq/nebula/iputil"
+	"github.com/slackhq/nebula/udp"
 )
 
 // TODO: incount and outcount are intended as a shortcut to locking the mutexes for every single packet
@@ -27,15 +29,17 @@ type connectionManager struct {
 	pendingDeletion      map[iputil.VpnIp]int
 	pendingDeletionLock  *sync.RWMutex
 	pendingDeletionTimer *SystemTimerWheel
+	promoteTimer         *SystemTimerWheel
 
 	checkInterval           int
 	pendingDeletionInterval int
+	promoteInterval         int
 
 	l *logrus.Logger
 	// I wanted to call one matLock
 }
 
-func newConnectionManager(ctx context.Context, l *logrus.Logger, intf *Interface, checkInterval, pendingDeletionInterval int) *connectionManager {
+func newConnectionManager(ctx context.Context, l *logrus.Logger, intf *Interface, checkInterval, pendingDeletionInterval, promoteInterval int) *connectionManager {
 	nc := &connectionManager{
 		hostMap:                 intf.hostMap,
 		in:                      make(map[iputil.VpnIp]struct{}),
@@ -49,8 +53,10 @@ func newConnectionManager(ctx context.Context, l *logrus.Logger, intf *Interface
 		pendingDeletion:         make(map[iputil.VpnIp]int),
 		pendingDeletionLock:     &sync.RWMutex{},
 		pendingDeletionTimer:    NewSystemTimerWheel(time.Millisecond*500, time.Second*60),
+		promoteTimer:            NewSystemTimerWheel(time.Millisecond*500, time.Second*60),
 		checkInterval:           checkInterval,
 		pendingDeletionInterval: pendingDeletionInterval,
+		promoteInterval:         promoteInterval,
 		l:                       l,
 	}
 	nc.Start(ctx)
@@ -159,6 +165,7 @@ func (n *connectionManager) Run(ctx context.Context) {
 		case now := <-clockSource.C:
 			n.HandleMonitorTick(now, p, nb, out)
 			n.HandleDeletionTick(now)
+			n.HandlePromoteTick(now)
 		}
 	}
 }
@@ -188,6 +195,15 @@ func (n *connectionManager) HandleMonitorTick(now time.Time, p, nb, out []byte) 
 			continue
 		}
 
+		if hostinfo != nil && hostinfo.ConnectionState != nil {
+			// Do not attempt promotion if you are a lighthouse but not relay
+			if n.intf.relayManager.GetAmRelay() || !n.intf.lightHouse.amLighthouse {
+				// probing for better paths
+				hostinfo.TryPromoteBest(now, n.hostMap.preferredRanges, n.intf)
+				n.promoteTimer.Add(vpnIp, time.Second*time.Duration(n.promoteInterval))
+			}
+		}
+
 		// If we saw an incoming packets from this ip and peer's certificate is not
 		// expired, just ignore.
 		if traf {
@@ -206,7 +222,7 @@ func (n *connectionManager) HandleMonitorTick(now time.Time, p, nb, out []byte) 
 			Debug("Tunnel status")
 
 		if hostinfo != nil && hostinfo.ConnectionState != nil {
-			// Send a test packet to trigger an authenticated tunnel test, this should suss out any lingering tunnel issues
+			// To be optimized, compatible with old version and sometimes probing not send
 			n.intf.SendMessageToVpnIp(header.Test, header.TestRequest, vpnIp, p, nb, out)
 
 		} else {
@@ -275,6 +291,164 @@ func (n *connectionManager) HandleDeletionTick(now time.Time) {
 			n.ClearPendingDeletion(vpnIp)
 		}
 	}
+}
+
+func (n *connectionManager) HandlePromoteTick(now time.Time) {
+	n.promoteTimer.advance(now)
+	minRoamNs := uint64(now.Add(-time.Duration(n.checkInterval) * time.Second).UnixNano())
+	for {
+		ep := n.promoteTimer.Purge()
+		if ep == nil {
+			break
+		}
+
+		vpnIp := ep.(iputil.VpnIp)
+
+		var (
+			bestKey   interface{}
+			bestState *RoamState
+		)
+
+		hostinfo, err := n.hostMap.QueryVpnIp(vpnIp)
+		if err != nil {
+			n.l.Debugf("Not found in hostmap: %s", vpnIp)
+			continue
+		}
+
+		hostinfo.roamRemotes.Range(func(key, val interface{}) bool {
+			state, ok := val.(*RoamState)
+			if !ok {
+				return true
+			}
+
+			if state.LastRoamTime < minRoamNs {
+				return true
+			}
+
+			if bestState == nil || state.LastRoamTime > bestState.LastRoamTime ||
+				(state.LastRoamTime == bestState.LastRoamTime && state.SRtt < bestState.SRtt) {
+				bestKey = key
+				bestState = state
+			}
+
+			return true
+		})
+
+		if n.l.Level >= logrus.DebugLevel {
+			hostinfo.logger(n.l).
+				WithField("key", bestKey).WithField("state", bestState).
+				Debug("promote roaming best")
+		}
+
+		if bestState == nil {
+			if n.CheckIn(vpnIp) {
+				cn := ""
+				if hostinfo.ConnectionState != nil && hostinfo.ConnectionState.peerCert != nil {
+					cn = hostinfo.ConnectionState.peerCert.Details.Name
+				}
+
+				hostinfo.logger(n.l).
+					WithField("tunnelCheck", m{"state": "dead", "method": "promote"}).
+					WithField("certName", cn).
+					Info("Tunnel status")
+
+				n.ClearIP(vpnIp)
+				n.ClearPendingDeletion(vpnIp)
+				// TODO: This is only here to let tests work. Should do proper mocking
+				if n.intf.lightHouse != nil {
+					n.intf.lightHouse.DeleteVpnIp(vpnIp)
+				}
+				n.hostMap.DeleteHostInfo(hostinfo)
+			}
+
+			continue
+		}
+
+		lastRoamKey := hostinfo.lastRoamKey
+		if lastRoamKey != nil && lastRoamKey == bestKey {
+			continue
+		}
+
+		if lastRoamVal, ok := hostinfo.roamRemotes.Load(lastRoamKey); ok {
+			if state, ok := lastRoamVal.(*RoamState); ok {
+				if state.LastRoamTime >= bestState.LastRoamTime && state.SRtt <= bestState.SRtt+SRttSuppress {
+					continue
+				}
+			}
+		}
+
+		switch key := bestKey.(type) {
+		case netip.AddrPort: //host
+			addr := udp.NewAddr(key.Addr().AsSlice(), key.Port())
+			n.handleHostRoaming(hostinfo, addr, bestKey, bestState)
+		case iputil.VpnIp: //relay
+			n.handleRelayRoaming(hostinfo, key, bestKey, bestState)
+		}
+	}
+}
+
+func (n *connectionManager) handleHostRoaming(hostinfo *HostInfo, addr *udp.Addr, bestKey interface{}, bestState *RoamState) {
+	lastRoamRemote := hostinfo.lastRoamRemote
+	if lastRoamRemote != nil {
+		if lastRoamRemote.Equals(addr) {
+			return
+		}
+	}
+
+	hostinfo.logger(n.l).
+		WithField("srtt", bestState.SRtt).
+		WithField("udpAddr", hostinfo.remote).WithField("newAddr", addr).
+		Info("Host roamed to new udp ip/port.")
+	hostinfo.lastRoamKey = bestKey
+	hostinfo.lastRoamRemote = addr
+	hostinfo.lastRoamRelay = nil
+	hostinfo.SetRemote(addr)
+}
+
+func (n *connectionManager) handleRelayRoaming(hostinfo *HostInfo, relayIp iputil.VpnIp, bestKey interface{}, bestState *RoamState) {
+	lastRoamRelay := hostinfo.lastRoamRelay
+	if lastRoamRelay != nil && *lastRoamRelay == relayIp {
+		return
+	}
+
+	relayHI := n.intf.getOrHandshake(relayIp)
+	if relayHI == nil {
+		hostinfo.logger(n.l).Debugf("Not found relay: %s", relayIp)
+		return
+	}
+
+	if _, ok := relayHI.relayState.QueryRelayForByIp(hostinfo.vpnIp); !ok {
+		idx, err := AddRelay(n.l, relayHI, n.intf.handshakeManager.mainHostMap, hostinfo.vpnIp, nil, TerminalType, Requested)
+		if err != nil {
+			hostinfo.logger(n.l).WithField("relay", relayIp).WithError(err).Info("Failed to add relay to hostmap")
+			return
+		}
+
+		m := NebulaControl{
+			Type:                NebulaControl_CreateRelayRequest,
+			InitiatorRelayIndex: idx,
+			RelayFromIp:         uint32(n.intf.lightHouse.myVpnIp),
+			RelayToIp:           uint32(hostinfo.vpnIp),
+		}
+		msg, err := m.Marshal()
+		if err != nil {
+			hostinfo.logger(n.l).
+				WithError(err).
+				Error("Failed to marshal Control message to create relay")
+			return
+		}
+
+		n.intf.sendMessageToVpnIp(header.Control, 0, relayHI, msg, make([]byte, 12), make([]byte, mtu))
+	}
+
+	hostinfo.logger(n.l).
+		WithField("srtt", bestState.SRtt).
+		WithField("relay", hostinfo.relay).WithField("newRelay", relayIp).
+		Info("Relay roamed to new vpn ip.")
+	hostinfo.lastRoamKey = bestKey
+	hostinfo.lastRoamRemote = nil
+	hostinfo.lastRoamRelay = &relayIp
+	hostinfo.relay = &relayIp
 }
 
 // handleInvalidCertificates will destroy a tunnel if pki.disconnect_invalid is true and the certificate is no longer valid

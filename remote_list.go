@@ -13,6 +13,9 @@ import (
 // forEachFunc is used to benefit folks that want to do work inside the lock
 type forEachFunc func(addr *udp.Addr, preferred bool)
 
+// forEachRelayFunc is used to benefit folks that want to do work inside the lock
+type forEachRelayFunc func(relay *iputil.VpnIp)
+
 // The checkFuncs here are to simplify bulk importing LH query response logic into a single function (reset slice and iterate)
 type checkFuncV4 func(vpnIp iputil.VpnIp, to *Ip4AndPort) bool
 type checkFuncV6 func(vpnIp iputil.VpnIp, to *Ip6AndPort) bool
@@ -250,6 +253,15 @@ func (r *RemoteList) Rebuild(preferredRanges []*net.IPNet) {
 
 	// Always re-sort, preferredRanges can change via HUP
 	r.unlockedSort(preferredRanges)
+}
+
+// ForEachRelay locks and will call the forEachRelay for every deduplicated address in the list
+func (r *RemoteList) ForEachRelay(forEachRelay forEachRelayFunc) {
+	r.RLock()
+	for _, v := range r.relays {
+		forEachRelay(v)
+	}
+	r.RUnlock()
 }
 
 // unlockedIsBad assumes you have the write lock and checks if the remote matches any entry in the blocked address list

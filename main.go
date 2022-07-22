@@ -259,6 +259,7 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 
 	checkInterval := c.GetInt("timers.connection_alive_interval", 5)
 	pendingDeletionInterval := c.GetInt("timers.pending_deletion_interval", 10)
+	promoteInterval := c.GetInt("timers.promote_interval", 1)
 	ifConfig := &InterfaceConfig{
 		HostMap:                 hostMap,
 		Inside:                  tun,
@@ -271,6 +272,7 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 		lightHouse:              lightHouse,
 		checkInterval:           checkInterval,
 		pendingDeletionInterval: pendingDeletionInterval,
+		promoteInterval:         promoteInterval,
 		DropLocalBroadcast:      c.GetBool("tun.drop_local_broadcast", false),
 		DropMulticast:           c.GetBool("tun.drop_multicast", false),
 		routines:                routines,

@@ -10,6 +10,7 @@ import (
 
 	"github.com/flynn/noise"
 	"github.com/slackhq/nebula/cert"
+	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/test"
 	"github.com/slackhq/nebula/udp"
@@ -44,6 +45,7 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 		firewall:         &Firewall{},
 		lightHouse:       lh,
 		handshakeManager: NewHandshakeManager(l, vpncidr, preferredRanges, hostMap, lh, &udp.Conn{}, defaultHandshakeConfig),
+		relayManager:     NewRelayManager(context.TODO(), l, hostMap, config.NewC(l)),
 		l:                l,
 	}
 	now := time.Now()
@@ -62,6 +64,7 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 		certState: cs,
 		H:         &noise.HandshakeState{},
 	}
+	hostinfo.remotes = NewRemoteList()
 
 	// We saw traffic out to vpnIp
 	nc.Out(vpnIp)
@@ -113,6 +116,7 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 		firewall:         &Firewall{},
 		lightHouse:       lh,
 		handshakeManager: NewHandshakeManager(l, vpncidr, preferredRanges, hostMap, lh, &udp.Conn{}, defaultHandshakeConfig),
+		relayManager:     NewRelayManager(context.TODO(), l, hostMap, config.NewC(l)),
 		l:                l,
 	}
 	now := time.Now()
@@ -131,6 +135,7 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 		certState: cs,
 		H:         &noise.HandshakeState{},
 	}
+	hostinfo.remotes = NewRemoteList()
 
 	// We saw traffic out to vpnIp
 	nc.Out(vpnIp)

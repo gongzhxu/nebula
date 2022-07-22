@@ -134,6 +134,7 @@ func (c *HandshakeManager) handleOutbound(vpnIp iputil.VpnIp, f udp.EncWriter, l
 			Info("Handshake timed out")
 		c.metricTimedOut.Inc(1)
 		c.pendingHostMap.DeleteHostInfo(hostinfo)
+		c.mainHostMap.DeleteHostInfo(hostinfo)
 		return
 	}
 

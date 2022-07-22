@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"github.com/flynn/noise"
@@ -50,6 +51,9 @@ func (f *Interface) readOutsidePackets(addr *udp.Addr, via interface{}, out []by
 
 	switch h.Type {
 	case header.Message:
+		if ci == nil {
+			return
+		}
 		// TODO handleEncrypted sends directly to addr on error. Handle this in the tunneling case.
 		if !f.handleEncrypted(ci, addr, h) {
 			return
@@ -73,7 +77,6 @@ func (f *Interface) readOutsidePackets(addr *udp.Addr, via interface{}, out []by
 			// Successfully validated the thing. Get rid of the Relay header.
 			signedPayload = signedPayload[header.Len:]
 			// Pull the Roaming parts up here, and return in all call paths.
-			f.handleHostRoaming(hostinfo, addr)
 			f.connectionManager.In(hostinfo.vpnIp)
 
 			relay, ok := hostinfo.relayState.QueryRelayForByIdx(h.RemoteIndex)
@@ -148,6 +151,10 @@ func (f *Interface) readOutsidePackets(addr *udp.Addr, via interface{}, out []by
 		// Fallthrough to the bottom to record incoming traffic
 
 	case header.Test:
+		if ci == nil {
+			return
+		}
+
 		f.messageMetrics.Rx(h.Type, h.Subtype, 1)
 		if !f.handleEncrypted(ci, addr, h) {
 			return
@@ -164,11 +171,60 @@ func (f *Interface) readOutsidePackets(addr *udp.Addr, via interface{}, out []by
 			return
 		}
 
-		if h.Subtype == header.TestRequest {
-			// This testRequest might be from TryPromoteBest, so we should roam
-			// to the new IP address before responding
-			f.handleHostRoaming(hostinfo, addr)
+		switch h.Subtype {
+		case header.TestRequest:
 			f.send(header.Test, header.TestReply, ci, hostinfo, d, nb, out)
+		case header.TestHostRequest:
+			f.sendTo(header.Test, header.TestHostReply, ci, hostinfo, addr, d, nb, make([]byte, mtu))
+		case header.TestHostReply:
+			m := &NebulaTestHost{}
+			err = m.Unmarshal(d)
+			if err != nil {
+				hostinfo.logger(f.l).WithError(err).
+					Error("Failed to unmarshal test host message")
+				return
+			}
+
+			f.handleTestHostReply(hostinfo, uint64(time.Now().UnixNano()), m)
+		case header.TestRelayRequest:
+			m := &NebulaTestRelay{}
+			err = m.Unmarshal(d)
+			if err != nil {
+				hostinfo.logger(f.l).WithError(err).
+					Error("Failed to unmarshal test relay message")
+				return
+			}
+
+			target := iputil.VpnIp(m.RelayToIp)
+			// Is the target of the relay me?
+			if target == f.myVpnIp {
+				f.send(header.Test, header.TestRelayReply, ci, hostinfo, d, nb, make([]byte, mtu))
+			} else {
+				targetHI := f.getOrHandshake(target)
+				if targetHI != nil {
+					f.sendMessageToVpnIp(header.Test, header.TestRelayRequest, targetHI, d, nb, make([]byte, mtu))
+				}
+			}
+		case header.TestRelayReply:
+			m := &NebulaTestRelay{}
+			err = m.Unmarshal(d)
+			if err != nil {
+				hostinfo.logger(f.l).WithError(err).
+					Error("Failed to unmarshal test relay message")
+				return
+			}
+
+			from := iputil.VpnIp(m.RelayFromIp)
+			if from == f.myVpnIp {
+				target := iputil.VpnIp(m.RelayToIp)
+				if targetHI, err := f.hostMap.QueryVpnIp(target); err == nil {
+					f.handleTestRelayReply(targetHI, uint64(time.Now().UnixNano()), m)
+				}
+			} else {
+				if fromHI, err := f.hostMap.QueryVpnIp(from); err == nil {
+					f.sendMessageToVpnIp(header.Test, header.TestRelayReply, fromHI, d, nb, make([]byte, mtu))
+				}
+			}
 		}
 
 		// Fallthrough to the bottom to record incoming traffic
@@ -225,8 +281,6 @@ func (f *Interface) readOutsidePackets(addr *udp.Addr, via interface{}, out []by
 		return
 	}
 
-	f.handleHostRoaming(hostinfo, addr)
-
 	f.connectionManager.In(hostinfo.vpnIp)
 }
 
@@ -245,27 +299,57 @@ func (f *Interface) sendCloseTunnel(h *HostInfo) {
 	f.send(header.CloseTunnel, 0, h.ConnectionState, h, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
 }
 
-func (f *Interface) handleHostRoaming(hostinfo *HostInfo, addr *udp.Addr) {
-	if addr != nil && !hostinfo.remote.Equals(addr) {
-		if !f.lightHouse.GetRemoteAllowList().Allow(hostinfo.vpnIp, addr.IP) {
-			hostinfo.logger(f.l).WithField("newAddr", addr).Debug("lighthouse.remote_allow_list denied roaming")
-			return
-		}
-		if !hostinfo.lastRoam.IsZero() && addr.Equals(hostinfo.lastRoamRemote) && time.Since(hostinfo.lastRoam) < RoamingSuppressSeconds*time.Second {
-			if f.l.Level >= logrus.DebugLevel {
-				hostinfo.logger(f.l).WithField("udpAddr", hostinfo.remote).WithField("newAddr", addr).
-					Debugf("Suppressing roam back to previous remote for %d seconds", RoamingSuppressSeconds)
-			}
-			return
-		}
-
-		hostinfo.logger(f.l).WithField("udpAddr", hostinfo.remote).WithField("newAddr", addr).
-			Info("Host roamed to new udp ip/port.")
-		hostinfo.lastRoam = time.Now()
-		hostinfo.lastRoamRemote = hostinfo.remote
-		hostinfo.SetRemote(addr)
+func (f *Interface) handleTestHostReply(hostinfo *HostInfo, nowNs uint64, m *NebulaTestHost) {
+	if !f.lightHouse.GetRemoteAllowList().Allow(hostinfo.vpnIp, m.Ip) {
+		hostinfo.logger(f.l).WithField("msg", m).Debug("lighthouse.remote_allow_list denied roaming")
+		return
 	}
 
+	ip, ok := netip.AddrFromSlice(m.Ip)
+	if !ok {
+		hostinfo.logger(f.l).WithField("msg", m).Error("handleTestHostReply Failed addr from slice")
+		return
+	}
+
+	val, ok := hostinfo.roamRemotes.Load(netip.AddrPortFrom(ip, uint16(m.Port)))
+	if !ok {
+		return
+	}
+
+	state, ok := val.(*RoamState)
+	if !ok {
+		return
+	}
+
+	// Should filter the except rtt
+	roamRtt := nowNs - m.Time
+	if state.SRtt != 0 {
+		roamRtt = (state.SRtt*SRttAlphaPots + (SRttAlphaBasic-SRttAlphaPots)*roamRtt) / SRttAlphaBasic
+	}
+
+	state.LastRoamTime = m.Time
+	state.SRtt = roamRtt
+}
+
+func (f *Interface) handleTestRelayReply(hostinfo *HostInfo, nowNs uint64, m *NebulaTestRelay) {
+	val, ok := hostinfo.roamRemotes.Load(iputil.VpnIp(m.RelayIp))
+	if !ok {
+		return
+	}
+
+	state, ok := val.(*RoamState)
+	if !ok {
+		return
+	}
+
+	// Should filter the except rtt
+	roamRtt := nowNs - m.Time
+	if state.SRtt != 0 {
+		roamRtt = (state.SRtt*SRttAlphaPots + (SRttAlphaBasic-SRttAlphaPots)*roamRtt) / SRttAlphaBasic
+	}
+
+	state.LastRoamTime = m.Time
+	state.SRtt = roamRtt
 }
 
 func (f *Interface) handleEncrypted(ci *ConnectionState, addr *udp.Addr, h *header.H) bool {
@@ -410,7 +494,6 @@ func (f *Interface) maybeSendRecvError(endpoint *udp.Addr, index uint32) {
 
 func (f *Interface) sendRecvError(endpoint *udp.Addr, index uint32) {
 	f.messageMetrics.Tx(header.RecvError, 0, 1)
-
 	//TODO: this should be a signed message so we can trust that we should drop the index
 	b := header.Encode(make([]byte, header.Len), header.Version, header.RecvError, 0, index, 0)
 	f.outside.WriteTo(b, endpoint)

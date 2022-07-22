@@ -55,8 +55,12 @@ const (
 )
 
 const (
-	TestRequest MessageSubType = 0
-	TestReply   MessageSubType = 1
+	TestRequest      MessageSubType = 0
+	TestReply        MessageSubType = 1
+	TestHostRequest  MessageSubType = 2
+	TestHostReply    MessageSubType = 3
+	TestRelayRequest MessageSubType = 4
+	TestRelayReply   MessageSubType = 5
 )
 
 const (
@@ -67,8 +71,12 @@ const (
 var ErrHeaderTooShort = errors.New("header is too short")
 
 var subTypeTestMap = map[MessageSubType]string{
-	TestRequest: "testRequest",
-	TestReply:   "testReply",
+	TestRequest:      "testRequest",
+	TestReply:        "testReply",
+	TestHostRequest:  "testHostRequest",
+	TestHostReply:    "testHostReply",
+	TestRelayRequest: "testRelayRequest",
+	TestRelayReply:   "testRelayReply",
 }
 
 var subTypeNoneMap = map[MessageSubType]string{0: "none"}
