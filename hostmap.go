@@ -19,13 +19,7 @@ import (
 )
 
 //const ProbeLen = 100
-const PromoteEvery = 1000
-const ReQueryEvery = 5000
 const MaxRemotes = 10
-
-// How long we should prevent roaming back to the previous IP.
-// This helps prevent flapping due to packets already in flight
-const RoamingSuppressSeconds = 2
 
 const (
 	Requested = iota
@@ -96,6 +90,20 @@ func (rs *RelayState) CopyRelayIps() []iputil.VpnIp {
 	return ret
 }
 
+func (rs *RelayState) CopyRelayPreferredIps(preferred iputil.VpnIp) []iputil.VpnIp {
+	rs.RLock()
+	defer rs.RUnlock()
+	ret := make([]iputil.VpnIp, 0, len(rs.relays))
+	ret = append(ret, preferred)
+
+	for ip := range rs.relays {
+		if ip != preferred {
+			ret = append(ret, ip)
+		}
+	}
+	return ret
+}
+
 func (rs *RelayState) CopyRelayForIps() []iputil.VpnIp {
 	rs.RLock()
 	defer rs.RUnlock()
@@ -152,8 +160,8 @@ type HostInfo struct {
 	sync.RWMutex
 
 	remote            *udp.Addr
+	relay             *iputil.VpnIp
 	remotes           *RemoteList
-	promoteCounter    uint32
 	ConnectionState   *ConnectionState
 	handshakeStart    time.Time        //todo: this an entry in the handshake manager
 	HandshakeReady    bool             //todo: being in the manager means you are ready
@@ -178,8 +186,10 @@ type HostInfo struct {
 	// This is used to avoid an attack where a handshake packet is replayed after some time
 	lastHandshakeTime uint64
 
-	lastRoam       time.Time
+	promoteCounter uint64
+	lastRoamSeq    uint64 //Roam sequence number
 	lastRoamRemote *udp.Addr
+	lastRoamRelay  *iputil.VpnIp
 }
 
 type ViaSender struct {
@@ -496,25 +506,14 @@ func (hm *HostMap) QueryReverseIndex(index uint32) (*HostInfo, error) {
 }
 
 func (hm *HostMap) QueryVpnIp(vpnIp iputil.VpnIp) (*HostInfo, error) {
-	return hm.queryVpnIp(vpnIp, nil)
+	return hm.queryVpnIp(vpnIp)
 }
 
-// PromoteBestQueryVpnIp will attempt to lazily switch to the best remote every
-// `PromoteEvery` calls to this function for a given host.
-func (hm *HostMap) PromoteBestQueryVpnIp(vpnIp iputil.VpnIp, ifce *Interface) (*HostInfo, error) {
-	return hm.queryVpnIp(vpnIp, ifce)
-}
-
-func (hm *HostMap) queryVpnIp(vpnIp iputil.VpnIp, promoteIfce *Interface) (*HostInfo, error) {
+func (hm *HostMap) queryVpnIp(vpnIp iputil.VpnIp) (*HostInfo, error) {
 	hm.RLock()
 	if h, ok := hm.Hosts[vpnIp]; ok {
 		hm.RUnlock()
-		// Do not attempt promotion if you are a lighthouse
-		if promoteIfce != nil && !promoteIfce.lightHouse.amLighthouse {
-			h.TryPromoteBest(hm.preferredRanges, promoteIfce)
-		}
 		return h, nil
-
 	}
 
 	hm.RUnlock()
@@ -591,36 +590,74 @@ func (hm *HostMap) Punchy(ctx context.Context, conn *udp.Conn) {
 // TryPromoteBest handles re-querying lighthouses and probing for better paths
 // NOTE: It is an error to call this if you are a lighthouse since they should not roam clients!
 func (i *HostInfo) TryPromoteBest(preferredRanges []*net.IPNet, ifce *Interface) {
-	c := atomic.AddUint32(&i.promoteCounter, 1)
-	if c%PromoteEvery == 0 {
-		// The lock here is currently protecting i.remote access
-		i.RLock()
-		remote := i.remote
-		i.RUnlock()
+	c := atomic.AddUint64(&i.promoteCounter, 1)
 
-		// return early if we are already on a preferred remote
-		if remote != nil {
-			rIP := remote.IP
-			for _, l := range preferredRanges {
-				if l.Contains(rIP) {
-					return
-				}
+	// The lock here is currently protecting i.remote access
+	i.RLock()
+	remote := i.remote
+	i.RUnlock()
+
+	// return early if we are already on a preferred remote
+	if remote != nil {
+		rIP := remote.IP
+		for _, l := range preferredRanges {
+			if l.Contains(rIP) {
+				return
 			}
 		}
+	}
 
-		i.remotes.ForEach(preferredRanges, func(addr *udp.Addr, preferred bool) {
-			if remote != nil && (addr == nil || !preferred) {
+	i.remotes.ForEach(preferredRanges, func(addr *udp.Addr, preferred bool) {
+		if addr == nil {
+			return
+		}
+
+		// Try to send a test packet to that host, this should
+		// cause it to detect a roaming event and switch remotes
+		m := NebulaTestHost{
+			Ip:   addr.IP,
+			Port: uint32(addr.Port),
+			Seq:  c,
+		}
+		msg, err := m.Marshal()
+		if err != nil {
+			i.logger(ifce.l).
+				WithError(err).Error("TryPromoteBest Failed to marshal test host message")
+			return
+		}
+
+		ifce.sendTo(header.Test, header.TestHostRequest, i.ConnectionState, i, addr, msg, make([]byte, 12, 12), make([]byte, mtu))
+	})
+
+	if ifce.handshakeManager.config.useRelays && !ifce.relayManager.GetAmRelay() && !ifce.lightHouse.IsLighthouseIP(i.vpnIp) {
+		i.remotes.ForEachRelay(func(relay *iputil.VpnIp) {
+			// Don't relay to myself, and don't relay through the host I'm trying to connect to
+			if relay == nil || *relay == i.vpnIp || *relay == ifce.myVpnIp {
 				return
 			}
 
-			// Try to send a test packet to that host, this should
-			// cause it to detect a roaming event and switch remotes
-			ifce.sendTo(header.Test, header.TestRequest, i.ConnectionState, i, addr, []byte(""), make([]byte, 12, 12), make([]byte, mtu))
+			m := NebulaTestRelay{
+				RelayToIp:   uint32(i.vpnIp),
+				RelayFromIp: uint32(ifce.myVpnIp),
+				RelayIp:     uint32(*relay),
+				Seq:         c,
+			}
+			msg, err := m.Marshal()
+			if err != nil {
+				i.logger(ifce.l).
+					WithError(err).Error("TryPromoteBest Failed to marshal test relay message")
+				return
+			}
+
+			relayHI := ifce.getOrHandshake(*relay)
+			if relayHI != nil {
+				ifce.sendMessageToVpnIp(header.Test, header.TestRelayRequest, relayHI, msg, make([]byte, 12, 12), make([]byte, mtu))
+			}
 		})
 	}
 
 	// Re query our lighthouses for new remotes occasionally
-	if c%ReQueryEvery == 0 && ifce.lightHouse != nil {
+	if ifce.lightHouse != nil {
 		ifce.lightHouse.QueryServer(i.vpnIp, ifce)
 	}
 }
@@ -724,7 +761,6 @@ func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, newRemote *udp.Addr) bool {
 
 	if newIsPreferred {
 		// Consider this a roaming event
-		i.lastRoam = time.Now()
 		i.lastRoamRemote = currentRemote.Copy()
 
 		i.SetRemote(newRemote)

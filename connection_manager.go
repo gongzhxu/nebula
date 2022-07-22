@@ -188,6 +188,14 @@ func (n *connectionManager) HandleMonitorTick(now time.Time, p, nb, out []byte) 
 			continue
 		}
 
+		if hostinfo != nil && hostinfo.ConnectionState != nil {
+			// Do not attempt promotion if you are a lighthouse but not relay
+			if !n.intf.lightHouse.amLighthouse || n.intf.relayManager.GetAmRelay() {
+				// probing for better paths
+				hostinfo.TryPromoteBest(n.hostMap.preferredRanges, n.intf)
+			}
+		}
+
 		// If we saw an incoming packets from this ip and peer's certificate is not
 		// expired, just ignore.
 		if traf {
@@ -206,7 +214,7 @@ func (n *connectionManager) HandleMonitorTick(now time.Time, p, nb, out []byte) 
 			Debug("Tunnel status")
 
 		if hostinfo != nil && hostinfo.ConnectionState != nil {
-			// Send a test packet to trigger an authenticated tunnel test, this should suss out any lingering tunnel issues
+			// To be optimized, compatible with old version and sometimes probing not send
 			n.intf.SendMessageToVpnIp(header.Test, header.TestRequest, vpnIp, p, nb, out)
 
 		} else {

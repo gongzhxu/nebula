@@ -2,6 +2,7 @@ package nebula
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -39,6 +40,17 @@ func configLogger(l *logrus.Logger, c *config.C) error {
 		}
 	default:
 		return fmt.Errorf("unknown log format `%s`. possible formats: %s", logFormat, []string{"text", "json"})
+	}
+
+	// set up our logging file
+	logFile := c.GetString("logging.file", "")
+	if logFile != "" {
+		f, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+		if err != nil {
+			return err
+		}
+
+		l.SetOutput(f)
 	}
 
 	return nil

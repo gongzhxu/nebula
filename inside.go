@@ -91,7 +91,7 @@ func (f *Interface) getOrHandshake(vpnIp iputil.VpnIp) *HostInfo {
 			return nil
 		}
 	}
-	hostinfo, err := f.hostMap.PromoteBestQueryVpnIp(vpnIp, f)
+	hostinfo, err := f.hostMap.QueryVpnIp(vpnIp)
 
 	//if err != nil || hostinfo.ConnectionState == nil {
 	if err != nil {
@@ -265,7 +265,8 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 		//TODO: log warning
 		return
 	}
-	useRelay := remote == nil && hostinfo.remote == nil
+	useRelay := remote == nil && (hostinfo.remote == nil || (hostinfo.lastRoamRemote == nil && hostinfo.lastRoamRelay != nil))
+
 	fullOut := out
 
 	if useRelay {
@@ -310,21 +311,28 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 		return
 	}
 
-	if remote != nil {
-		err = f.writers[q].WriteTo(out, remote)
-		if err != nil {
-			hostinfo.logger(f.l).WithError(err).
-				WithField("udpAddr", remote).Error("Failed to write outgoing packet")
+	if !useRelay {
+		if remote == nil {
+			remote = hostinfo.remote
 		}
-	} else if hostinfo.remote != nil {
-		err = f.writers[q].WriteTo(out, hostinfo.remote)
-		if err != nil {
-			hostinfo.logger(f.l).WithError(err).
-				WithField("udpAddr", remote).Error("Failed to write outgoing packet")
+
+		if remote != nil {
+			err = f.writers[q].WriteTo(out, remote)
+			if err != nil {
+				hostinfo.logger(f.l).WithError(err).
+					WithField("udpAddr", remote).Error("Failed to write outgoing packet")
+			}
 		}
 	} else {
 		// Try to send via a relay
-		for _, relayIP := range hostinfo.relayState.CopyRelayIps() {
+		var relayIPs []iputil.VpnIp
+		if hostinfo.relay != nil {
+			relayIPs = hostinfo.relayState.CopyRelayPreferredIps(*hostinfo.relay)
+		} else {
+			relayIPs = hostinfo.relayState.CopyRelayIps()
+		}
+
+		for _, relayIP := range relayIPs {
 			relayHostInfo, err := f.hostMap.QueryVpnIp(relayIP)
 			if err != nil {
 				hostinfo.logger(f.l).WithField("relayIp", relayIP).WithError(err).Info("sendNoMetrics failed to find HostInfo")
@@ -339,9 +347,14 @@ func (f *Interface) sendNoMetrics(t header.MessageType, st header.MessageSubType
 				continue
 			}
 			f.SendVia(relayHostInfo, relay, out, nb, fullOut[:header.Len+len(out)], true)
-			break
+			return
 		}
+
+		hostinfo.logger(f.l).Info("Deleting hostMap hostinfo")
+		//If there is no relay available delete the host
+		f.hostMap.DeleteHostInfo(hostinfo)
 	}
+
 	return
 }
 

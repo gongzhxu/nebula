@@ -1,7 +1,7 @@
 syntax = "proto3";
 package nebula;
 
-option go_package = "github.com/slackhq/nebula";
+option go_package = "nebula";
 
 message NebulaMeta {
   enum MessageType {
@@ -77,4 +77,17 @@ message NebulaControl {
   uint32 ResponderRelayIndex = 3;
   uint32 RelayToIp = 4;
   uint32 RelayFromIp = 5;
+}
+
+message NebulaTestHost {
+  bytes Ip = 1;
+  uint32 Port = 2;
+  uint64 Seq = 3; //Request sequence number
+}
+
+message NebulaTestRelay {
+  uint32 RelayToIp = 1;
+  uint32 RelayFromIp = 2;
+  uint32 RelayIp = 3;
+  uint64 Seq = 4;
 }
