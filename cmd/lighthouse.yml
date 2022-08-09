@@ -1,0 +1,29 @@
+logging:
+  # panic, fatal, error, warning, info, or debug. Default is info
+  level: info
+  format: json
+  file: lighthouse.log
+
+pki:
+  ca: ./nebula-cert/ca.crt
+  cert: ./nebula-cert/lighthouse.crt
+  key: ./nebula-cert/lighthouse.key
+
+lighthouse:
+  am_lighthouse: true
+  hosts: []
+  remote_allow_list:
+
+listen:
+  host: 0.0.0.0
+  port: 4242
+
+tun:
+  dev: nebula1
+
+firewall:
+  outbound: [{"port": "any", "proto": "any", "host": "any"}]
+  inbound: [{"port": "any", "proto": "any", "host": "any"}]
+
+relay:
+  am_relay: true

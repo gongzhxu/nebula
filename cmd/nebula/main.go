@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 
 	"github.com/sirupsen/logrus"
@@ -25,6 +27,10 @@ func main() {
 	printUsage := flag.Bool("help", false, "Print command line usage")
 
 	flag.Parse()
+
+	go func() {
+		http.ListenAndServe(":6060", nil)
+	}()
 
 	if *printVersion {
 		fmt.Printf("Version: %s\n", Build)
